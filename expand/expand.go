@@ -220,81 +220,19 @@ func Format(cfg *Config, format string, args []string) (string, int, error) {
 
 formatLoop:
 	for i := 0; i < len(format); i++ {
-		// readDigits reads from 0 to max digits, either octal or
-		// hexadecimal.
-		readDigits := func(max int, hex bool) string {
-			j := 0
-			for ; j < max; j++ {
-				c := format[i+j]
-				if (c >= '0' && c <= '9') ||
-					(hex && c >= 'a' && c <= 'f') ||
-					(hex && c >= 'A' && c <= 'F') {
-					// valid octal or hex char
-				} else {
-					break
-				}
-			}
-			digits := format[i : i+j]
-			i += j - 1 // -1 since the outer loop does i++
-			return digits
-		}
 		c := format[i]
 		switch {
 		case c == '\\': // escaped
-			i++
-			switch c = format[i]; c {
-			case 'a': // bell
-				buf.WriteByte('\a')
-			case 'b': // backspace
-				buf.WriteByte('\b')
-			case 'e', 'E': // escape
-				buf.WriteByte('\x1b')
-			case 'f': // form feed
-				buf.WriteByte('\f')
-			case 'n': // new line
-				buf.WriteByte('\n')
-			case 'r': // carriage return
-				buf.WriteByte('\r')
-			case 't': // horizontal tab
-				buf.WriteByte('\t')
-			case 'v': // vertical tab
-				buf.WriteByte('\v')
-			case '\\', '\'', '"', '?': // just the character
-				buf.WriteByte(c)
-			case '0', '1', '2', '3', '4', '5', '6', '7':
-				digits := readDigits(3, false)
-				// if digits don't fit in 8 bits, 0xff via strconv
-				n, _ := strconv.ParseUint(digits, 8, 8)
-				buf.WriteByte(byte(n))
-			case 'x', 'u', 'U':
-				i++
-				max := 2
-				if c == 'u' {
-					max = 4
-				} else if c == 'U' {
-					max = 8
-				}
-				digits := readDigits(max, true)
-				if len(digits) > 0 {
-					// can't error
-					n, _ := strconv.ParseUint(digits, 16, 32)
-					if n == 0 {
-						// If we're about to print \x00,
-						// stop the entire loop, like bash.
-						break formatLoop
-					}
-					if c == 'x' {
-						// always as a single byte
-						buf.WriteByte(byte(n))
-					} else {
-						buf.WriteRune(rune(n))
-					}
-					break
-				}
-				fallthrough
-			default: // no escape sequence
-				buf.WriteByte('\\')
-				buf.WriteByte(c)
+			consumed, done, err := formatBackslashSequence(format[i:], buf)
+			if err != nil {
+				return "", 0, err
+			}
+
+			// We subtract one because the outer for loop will increment for us.
+			i += consumed - 1
+
+			if done {
+				break formatLoop
 			}
 		case len(fmts) > 0:
 			switch c {
@@ -319,13 +257,18 @@ formatLoop:
 				fmts = append(fmts, c)
 			case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
 				fmts = append(fmts, c)
-			case 's', 'd', 'i', 'u', 'o', 'x':
+			case 's', 'b', 'd', 'i', 'u', 'o', 'x':
 				arg := ""
 				if len(args) > 0 {
 					arg, args = args[0], args[1:]
 				}
-				var farg interface{} = arg
-				if c != 's' {
+				var farg interface{}
+				if c == 'b' {
+					err := expandBackslashSequencesAndCopy(arg, buf)
+					if err != nil {
+						return "", 0, err
+					}
+				} else if c != 's' {
 					n, _ := strconv.ParseInt(arg, 0, 0)
 					if c == 'i' || c == 'd' {
 						farg = int(n)
@@ -335,9 +278,13 @@ formatLoop:
 					if c == 'i' || c == 'u' {
 						c = 'd'
 					}
+				} else {
+					farg = arg
 				}
-				fmts = append(fmts, c)
-				fmt.Fprintf(buf, string(fmts), farg)
+				if farg != nil {
+					fmts = append(fmts, c)
+					fmt.Fprintf(buf, string(fmts), farg)
+				}
 				fmts = nil
 			default:
 				return "", 0, fmt.Errorf("invalid format char: %c", c)
@@ -354,6 +301,124 @@ formatLoop:
 		return "", 0, fmt.Errorf("missing format char")
 	}
 	return buf.String(), initialArgs - len(args), nil
+}
+
+func expandBackslashSequencesAndCopy(s string, buf *bytes.Buffer) error {
+	for i := 0; i < len(s); {
+		if s[i] == '\\' {
+			consumed, done, err := formatBackslashSequence(s[i:], buf)
+			if err != nil {
+				return err
+			}
+
+			if done {
+				break
+			}
+
+			i += consumed
+		} else {
+			buf.WriteByte(s[i])
+			i++
+		}
+	}
+
+	return nil
+}
+
+func formatBackslashSequence(format string, buf *bytes.Buffer) (consumed int, done bool, err error) {
+	if len(format) < 1 || format[0] != '\\' {
+		return 0, false, fmt.Errorf("no escape sequence found")
+	}
+
+	consumed++
+
+	// readDigits reads from 0 to max digits, either octal or
+	// hexadecimal.
+	readDigits := func(max int, hex bool) string {
+		j := 0
+		for ; j < max; j++ {
+			c := format[consumed+j]
+			if (c >= '0' && c <= '9') ||
+				(hex && c >= 'a' && c <= 'f') ||
+				(hex && c >= 'A' && c <= 'F') {
+				// valid octal or hex char
+			} else {
+				break
+			}
+		}
+		return format[consumed : consumed+j]
+	}
+
+	switch c := format[consumed]; c {
+	case 'a': // bell
+		buf.WriteByte('\a')
+		consumed++
+	case 'b': // backspace
+		buf.WriteByte('\b')
+		consumed++
+	case 'e', 'E': // escape
+		buf.WriteByte('\x1b')
+		consumed++
+	case 'f': // form feed
+		buf.WriteByte('\f')
+		consumed++
+	case 'n': // new line
+		buf.WriteByte('\n')
+		consumed++
+	case 'r': // carriage return
+		buf.WriteByte('\r')
+		consumed++
+	case 't': // horizontal tab
+		buf.WriteByte('\t')
+		consumed++
+	case 'v': // vertical tab
+		buf.WriteByte('\v')
+		consumed++
+	case '\\', '\'', '"', '?': // just the character
+		buf.WriteByte(c)
+		consumed++
+	case '0', '1', '2', '3', '4', '5', '6', '7':
+		digits := readDigits(3, false)
+		consumed += len(digits)
+		// if digits don't fit in 8 bits, 0xff via strconv
+		n, _ := strconv.ParseUint(digits, 8, 8)
+		buf.WriteByte(byte(n))
+	case 'x', 'u', 'U':
+		consumed++
+		max := 2
+		if c == 'u' {
+			max = 4
+		} else if c == 'U' {
+			max = 8
+		}
+		digits := readDigits(max, true)
+		if len(digits) > 0 {
+			consumed += len(digits)
+			// can't error
+			n, _ := strconv.ParseUint(digits, 16, 32)
+			if n == 0 {
+				// If we're about to print \x00,
+				// stop the entire loop, like bash.
+				done = true
+				break
+			}
+			if c == 'x' {
+				// always as a single byte
+				buf.WriteByte(byte(n))
+			} else {
+				buf.WriteRune(rune(n))
+			}
+			break
+		}
+		consumed--
+		fallthrough
+	default: // no escape sequence
+		buf.WriteByte('\\')
+		buf.WriteByte(c)
+		consumed++
+	}
+
+	return consumed, done, nil
 }
 
 func (cfg *Config) fieldJoin(parts []fieldPart) string {
